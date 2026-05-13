@@ -51,6 +51,7 @@ import {
   StylePool
 } from './screen.js'
 import { applySearchHighlight } from './searchHighlight.js'
+import { applyHyperlinkHoverHighlight } from './hyperlinkHover.js'
 import {
   applySelectionOverlay,
   captureScrolledRows,
@@ -150,6 +151,15 @@ export type Options = {
   patchConsole: boolean
   waitUntilExit?: () => Promise<void>
   onFrame?: (event: FrameEvent) => void
+  /**
+   * Called when a click lands on a cell with an OSC 8 hyperlink (or a
+   * plain-text URL detected by findPlainTextUrlAt). The host is responsible
+   * for opening the URL — typically via the OS `open` / `xdg-open` /
+   * `start` shell. Without this wired up, links rendered by `<Link>` look
+   * underlined but do nothing on click in any terminal where mouse
+   * tracking is on (Cmd+click is consumed by the TUI, not Terminal.app).
+   */
+  onHyperlinkClick?: (url: string) => void
 }
 export default class Ink {
   private readonly log: LogUpdate
@@ -232,6 +242,14 @@ export default class Ink {
   // so App.tsx's handleMouseEvent is stateless — dispatchHover diffs
   // against this set and mutates it in place.
   private readonly hoveredNodes = new Set<dom.DOMElement>()
+
+  // The OSC 8 hyperlink URL under the pointer, or undefined when the cursor
+  // isn't on a link. Updated from dispatchHover; consumed by the render-pass
+  // overlay (applyHyperlinkHoverHighlight) to invert link cells under the
+  // pointer. This is the closest the TUI can get to the desktop's
+  // cursor-changes-on-hover affordance — terminals don't expose cursor
+  // shape control to applications.
+  private hoveredHyperlink: string | undefined = undefined
   // Set by <AlternateScreen> via setAltScreenActive(). Controls the
   // renderer's cursor.y clamping (keeps cursor in-viewport to avoid
   // LF-induced scroll when screen.height === terminalRows) and gates
@@ -286,6 +304,14 @@ export default class Ink {
       this.restoreConsole = this.patchConsole()
       this.restoreStderr = this.patchStderr()
     }
+
+    // Host-supplied hyperlink-open callback. The mouse-event pipeline
+    // (App.tsx → onOpenHyperlink → Ink.openHyperlink → onHyperlinkClick)
+    // is fully wired internally; without this assignment the optional
+    // chain in openHyperlink() bails silently and clicks on URLs do
+    // nothing. The field stays writable so tests / debug overlays can
+    // still rebind it after construction.
+    this.onHyperlinkClick = options.onHyperlinkClick
 
     this.terminal = {
       stdout: options.stdout,
@@ -768,6 +794,12 @@ export default class Ink {
       // Scan-highlight: inverse on ALL visible matches (less/vim style).
       // Position-highlight (below) overlays CURRENT (yellow) on top.
       hlActive = applySearchHighlight(frame.screen, this.searchHighlightQuery, this.stylePool)
+
+      // Hyperlink hover overlay: inverts every cell of the link currently
+      // under the pointer. Cheap-ish (linear scan of the visible buffer),
+      // only fires when hoveredHyperlink is set.
+      const hoverApplied = applyHyperlinkHoverHighlight(frame.screen, this.hoveredHyperlink, this.stylePool)
+      hlActive = hlActive || hoverApplied
 
       // Position-based CURRENT: write yellow at positions[currentIdx] +
       // rowOffset. No scanning — positions came from a prior scan when
@@ -1770,6 +1802,17 @@ export default class Ink {
     }
 
     dispatchHover(this.rootNode, col, row, this.hoveredNodes)
+
+    // Hover affordance for hyperlinks: read the cell at the pointer, store
+    // its URL (or clear when the pointer leaves a link), and request a
+    // repaint when the value changes. The render-pass overlay paints the
+    // highlight; we just track which URL is "hot".
+    const next = this.getHyperlinkAt(col, row)
+
+    if (next !== this.hoveredHyperlink) {
+      this.hoveredHyperlink = next
+      this.scheduleRender()
+    }
   }
   dispatchKeyboardEvent(parsedKey: ParsedKey): void {
     const target = this.focusManager.activeElement ?? this.rootNode
@@ -1815,7 +1858,8 @@ export default class Ink {
 
   /**
    * Optional callback fired when clicking an OSC 8 hyperlink in fullscreen
-   * mode. Set by FullscreenLayout via useLayoutEffect.
+   * mode. Set from the host via the `onHyperlinkClick` Render/Ink option,
+   * or directly on the instance for late-bound test scenarios.
    */
   onHyperlinkClick: ((url: string) => void) | undefined
 

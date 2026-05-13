@@ -44,6 +44,16 @@ export type RenderOptions = {
    * Called after each frame render with timing and flicker information.
    */
   onFrame?: (event: FrameEvent) => void
+
+  /**
+   * Called when a click lands on a cell with an OSC 8 hyperlink (or a
+   * plain-text URL the renderer detects on the same row). The host owns
+   * the actual open — typically `child_process.spawn('open' | 'xdg-open' |
+   * 'start', [url])`. Hermes wires this in `entry.tsx`; library users
+   * who don't pass it will see clickable underline styling but no action
+   * on click in any terminal where mouse tracking is on.
+   */
+  onHyperlinkClick?: (url: string) => void
 }
 
 export type Instance = {
@@ -138,7 +148,8 @@ export async function createRoot({
   stderr = process.stderr,
   exitOnCtrlC = true,
   patchConsole = true,
-  onFrame
+  onFrame,
+  onHyperlinkClick
 }: RenderOptions = {}): Promise<Root> {
   // See wrappedRender — preserve microtask boundary from the old WASM await.
   await Promise.resolve()
@@ -149,7 +160,8 @@ export async function createRoot({
     stderr,
     exitOnCtrlC,
     patchConsole,
-    onFrame
+    onFrame,
+    onHyperlinkClick
   })
 
   // Register in the instances map so that code that looks up the Ink
