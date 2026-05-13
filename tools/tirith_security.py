@@ -33,6 +33,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import zipfile
 
 from hermes_constants import get_hermes_home
 
@@ -139,14 +140,24 @@ def _is_install_failed_on_disk() -> bool:
     - No marker exists
     - Marker is older than _MARKER_TTL (24h)
     - Marker reason is 'cosign_missing' and cosign is now on PATH
+    - Marker reason is 'unsupported_platform' and this platform is now supported
     """
     reason = _read_failure_reason()
     if reason is None:
         return False
-    if reason == "cosign_missing" and shutil.which("cosign"):
+    if _retryable_failure_is_resolved(reason):
         _clear_install_failed()
         return False
     return True
+
+
+def _retryable_failure_is_resolved(reason: str) -> bool:
+    """Return True when a persisted install failure should be retried now."""
+    if reason == "cosign_missing" and shutil.which("cosign"):
+        return True
+    if reason == "unsupported_platform" and _detect_target() is not None:
+        return True
+    return False
 
 
 def _mark_install_failed(reason: str = ""):
@@ -181,6 +192,31 @@ def _hermes_bin_dir() -> str:
     return d
 
 
+def _tirith_executable_names() -> tuple[str, ...]:
+    """Return platform-appropriate tirith executable names."""
+    if platform.system() == "Windows":
+        return ("tirith.exe", "tirith")
+    return ("tirith",)
+
+
+def _find_tirith_on_path() -> str | None:
+    """Find tirith on PATH, including the .exe binary name on Windows."""
+    for name in _tirith_executable_names():
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _find_tirith_in_hermes_bin() -> str | None:
+    """Find a previously installed tirith binary under $HERMES_HOME/bin."""
+    for name in _tirith_executable_names():
+        candidate = os.path.join(_hermes_bin_dir(), name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def _detect_target() -> str | None:
     """Return the Rust target triple for the current platform, or None."""
     system = platform.system()
@@ -191,6 +227,8 @@ def _detect_target() -> str | None:
         plat = "apple-darwin"
     elif system in {"Linux", "Android"}:
         plat = "unknown-linux-gnu"
+    elif system == "Windows":
+        plat = "pc-windows-msvc"
     else:
         return None
 
@@ -295,7 +333,10 @@ def _install_tirith(*, log_failures: bool = True) -> tuple[str | None, str]:
                      platform.system(), platform.machine())
         return None, "unsupported_platform"
 
-    archive_name = f"tirith-{target}.tar.gz"
+    is_windows = platform.system() == "Windows"
+    archive_ext = "zip" if is_windows else "tar.gz"
+    binary_name = "tirith.exe" if is_windows else "tirith"
+    archive_name = f"tirith-{target}.{archive_ext}"
     base_url = f"https://github.com/{_REPO}/releases/latest/download"
 
     tmpdir = tempfile.mkdtemp(prefix="tirith-install-")
@@ -346,21 +387,36 @@ def _install_tirith(*, log_failures: bool = True) -> tuple[str | None, str]:
         if not _verify_checksum(archive_path, checksums_path, archive_name):
             return None, "checksum_failed"
 
-        with tarfile.open(archive_path, "r:gz") as tar:
-            # Extract only the tirith binary (safety: reject paths with ..)
-            for member in tar.getmembers():
-                if member.name == "tirith" or member.name.endswith("/tirith"):
-                    if ".." in member.name:
-                        continue
-                    member.name = "tirith"
-                    tar.extract(member, tmpdir)
-                    break
-            else:
-                log("tirith binary not found in archive")
-                return None, "binary_not_in_archive"
+        if is_windows:
+            with zipfile.ZipFile(archive_path) as zf:
+                for member in zf.infolist():
+                    name = member.filename.replace("\\", "/")
+                    if name == "tirith.exe" or name.endswith("/tirith.exe"):
+                        if ".." in name.split("/"):
+                            continue
+                        extracted_path = os.path.join(tmpdir, binary_name)
+                        with zf.open(member) as src_file, open(extracted_path, "wb") as dest_file:
+                            shutil.copyfileobj(src_file, dest_file)
+                        break
+                else:
+                    log("tirith binary not found in archive")
+                    return None, "binary_not_in_archive"
+        else:
+            with tarfile.open(archive_path, "r:gz") as tar:
+                # Extract only the tirith binary (safety: reject paths with ..)
+                for member in tar.getmembers():
+                    if member.name == "tirith" or member.name.endswith("/tirith"):
+                        if ".." in member.name:
+                            continue
+                        member.name = binary_name
+                        tar.extract(member, tmpdir)
+                        break
+                else:
+                    log("tirith binary not found in archive")
+                    return None, "binary_not_in_archive"
 
-        src = os.path.join(tmpdir, "tirith")
-        dest = os.path.join(_hermes_bin_dir(), "tirith")
+        src = os.path.join(tmpdir, binary_name)
+        dest = os.path.join(_hermes_bin_dir(), binary_name)
         try:
             shutil.move(src, dest)
         except OSError:
@@ -434,25 +490,25 @@ def _resolve_tirith_path(configured_path: str) -> str:
     # Default "tirith" — always re-run cheap local checks so a manual
     # install is picked up even after a previous network failure (P2 fix:
     # long-lived gateway/CLI recovers without restart).
-    found = shutil.which("tirith")
+    found = _find_tirith_on_path()
     if found:
         _resolved_path = found
         _install_failure_reason = ""
         _clear_install_failed()
         return found
 
-    hermes_bin = os.path.join(_hermes_bin_dir(), "tirith")
-    if os.path.isfile(hermes_bin) and os.access(hermes_bin, os.X_OK):
+    hermes_bin = _find_tirith_in_hermes_bin()
+    if hermes_bin:
         _resolved_path = hermes_bin
         _install_failure_reason = ""
         _clear_install_failed()
         return hermes_bin
 
-    # Local checks failed.  If a previous install attempt already failed,
-    # skip the network retry — UNLESS the failure was "cosign_missing" and
-    # cosign is now available (retryable cause resolved in-process).
+    # Local checks failed. If a previous install attempt already failed,
+    # skip the network retry unless the failure cause is now resolved
+    # (for example, cosign was installed or this platform is now supported).
     if install_failed:
-        if _install_failure_reason == "cosign_missing" and shutil.which("cosign"):
+        if _retryable_failure_is_resolved(_install_failure_reason):
             # Retryable cause resolved — clear sentinel and fall through to retry
             _resolved_path = None
             _install_failure_reason = ""
@@ -499,14 +555,14 @@ def _background_install(*, log_failures: bool = True):
             return
 
         # Re-check local paths (may have been installed by another process)
-        found = shutil.which("tirith")
+        found = _find_tirith_on_path()
         if found:
             _resolved_path = found
             _install_failure_reason = ""
             return
 
-        hermes_bin = os.path.join(_hermes_bin_dir(), "tirith")
-        if os.path.isfile(hermes_bin) and os.access(hermes_bin, os.X_OK):
+        hermes_bin = _find_tirith_in_hermes_bin()
+        if hermes_bin:
             _resolved_path = hermes_bin
             _install_failure_reason = ""
             return
@@ -560,15 +616,15 @@ def ensure_installed(*, log_failures: bool = True):
         return None
 
     # Default "tirith" — quick local checks first (no network)
-    found = shutil.which("tirith")
+    found = _find_tirith_on_path()
     if found:
         _resolved_path = found
         _install_failure_reason = ""
         _clear_install_failed()
         return found
 
-    hermes_bin = os.path.join(_hermes_bin_dir(), "tirith")
-    if os.path.isfile(hermes_bin) and os.access(hermes_bin, os.X_OK):
+    hermes_bin = _find_tirith_in_hermes_bin()
+    if hermes_bin:
         _resolved_path = hermes_bin
         _install_failure_reason = ""
         _clear_install_failed()
@@ -576,15 +632,16 @@ def ensure_installed(*, log_failures: bool = True):
 
     # If previously failed in-memory, check if the cause is now resolved
     if _resolved_path is _INSTALL_FAILED:
-        if _install_failure_reason == "cosign_missing" and shutil.which("cosign"):
+        if _retryable_failure_is_resolved(_install_failure_reason):
             _resolved_path = None
             _install_failure_reason = ""
             _clear_install_failed()
         else:
             return None
 
-    # Check disk failure marker (skip network attempt for 24h, unless
-    # the cosign_missing reason was resolved — handled by _is_install_failed_on_disk).
+    # Check disk failure marker (skip network attempt for 24h unless the
+    # persisted reason is now resolved, such as cosign_missing after cosign is
+    # installed or unsupported_platform after a release adds platform support).
     # Preserve the marker's real reason for in-memory retry logic.
     disk_reason = _read_failure_reason()
     if disk_reason is not None and _is_install_failed_on_disk():

@@ -332,6 +332,38 @@ class TestEnsureInstalled:
             mock_thread.start.assert_called_once()
         _tirith_mod._resolved_path = None
 
+    @patch("tools.tirith_security.platform.system", return_value="Windows")
+    @patch("tools.tirith_security._clear_install_failed")
+    @patch("tools.tirith_security._hermes_bin_dir", return_value="C:/Users/danie/.hermes/bin")
+    @patch("tools.tirith_security.shutil.which", return_value=None)
+    @patch("tools.tirith_security._load_security_config")
+    def test_windows_uses_existing_tirith_exe_from_hermes_bin(
+        self, mock_cfg, mock_which, mock_bin_dir, mock_clear, mock_system
+    ):
+        """Windows installs may already have tirith.exe even when tirith is absent."""
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        _tirith_mod._resolved_path = None
+
+        def _isfile(path):
+            return path.replace("\\", "/").endswith("/tirith.exe")
+
+        with patch("tools.tirith_security.os.path.isfile", side_effect=_isfile), \
+             patch("tools.tirith_security.os.access", return_value=True):
+            result = ensure_installed()
+
+        assert result == "C:/Users/danie/.hermes/bin/tirith.exe"
+        mock_clear.assert_called_once()
+        _tirith_mod._resolved_path = None
+
+
+class TestWindowsTarget:
+    @patch("tools.tirith_security.platform.machine", return_value="AMD64")
+    @patch("tools.tirith_security.platform.system", return_value="Windows")
+    def test_detect_target_supports_windows_msvc(self, mock_system, mock_machine):
+        from tools.tirith_security import _detect_target
+        assert _detect_target() == "x86_64-pc-windows-msvc"
+
 
 # ---------------------------------------------------------------------------
 # Failed download caches the miss (Finding #1)
@@ -618,6 +650,32 @@ class TestCosignVerification:
         assert mock_checksum.called  # reached SHA-256 step
         assert mock_cosign.called  # cosign was invoked
 
+    @patch("tools.tirith_security.zipfile.ZipFile")
+    @patch("tools.tirith_security._verify_checksum", return_value=True)
+    @patch("tools.tirith_security.platform.system", return_value="Windows")
+    @patch("tools.tirith_security.shutil.which", return_value=None)
+    @patch("tools.tirith_security._download_file")
+    @patch("tools.tirith_security._detect_target", return_value="x86_64-pc-windows-msvc")
+    def test_install_uses_windows_zip_asset(self, mock_target, mock_dl, mock_which,
+                                           mock_system, mock_checksum, mock_zipfile):
+        """Windows auto-install should fetch/extract the .zip tirith.exe asset."""
+        from tools.tirith_security import _install_tirith
+        mock_zip = MagicMock()
+        mock_zip.__enter__ = MagicMock(return_value=mock_zip)
+        mock_zip.__exit__ = MagicMock(return_value=False)
+        mock_zip.infolist.return_value = []
+        mock_zipfile.return_value = mock_zip
+
+        path, reason = _install_tirith()
+
+        assert path is None
+        assert reason == "binary_not_in_archive"
+        assert any(
+            call.args[0].endswith("tirith-x86_64-pc-windows-msvc.zip")
+            for call in mock_dl.call_args_list
+        )
+        assert mock_checksum.called
+
 
 # ---------------------------------------------------------------------------
 # Background install / non-blocking startup (P2)
@@ -662,6 +720,32 @@ class TestBackgroundInstall:
             assert result is None
             assert _tirith_mod._resolved_path is _tirith_mod._INSTALL_FAILED
             assert _tirith_mod._install_failure_reason == "download_failed"
+
+        _tirith_mod._resolved_path = None
+
+    def test_ensure_installed_retries_stale_unsupported_platform_marker(self):
+        """A new supported Windows build must not be suppressed by old markers."""
+        _tirith_mod._resolved_path = None
+
+        with patch("tools.tirith_security._load_security_config",
+                   return_value={"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}), \
+             patch("tools.tirith_security.shutil.which", return_value=None), \
+             patch("tools.tirith_security._hermes_bin_dir", return_value="/nonexistent"), \
+             patch("tools.tirith_security._read_failure_reason", return_value="unsupported_platform"), \
+             patch("tools.tirith_security._detect_target", return_value="x86_64-pc-windows-msvc"), \
+             patch("tools.tirith_security._clear_install_failed") as mock_clear, \
+             patch("tools.tirith_security.threading.Thread") as MockThread:
+            mock_thread = MagicMock()
+            mock_thread.is_alive.return_value = False
+            MockThread.return_value = mock_thread
+
+            result = ensure_installed()
+
+            assert result is None
+            MockThread.assert_called_once()
+            mock_thread.start.assert_called_once()
+            mock_clear.assert_called_once()
 
         _tirith_mod._resolved_path = None
 
