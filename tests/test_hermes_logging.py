@@ -695,6 +695,7 @@ class TestAddRotatingHandler:
                 logger.removeHandler(h)
                 h.close()
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX chmod mode bits are not reliable on Windows")
     def test_managed_mode_initial_open_sets_group_writable(self, tmp_path):
         log_path = tmp_path / "managed-open.log"
         logger = logging.getLogger("_test_rotating_managed_open")
@@ -719,6 +720,7 @@ class TestAddRotatingHandler:
                 logger.removeHandler(h)
                 h.close()
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX chmod mode bits are not reliable on Windows")
     def test_managed_mode_rollover_sets_group_writable(self, tmp_path):
         log_path = tmp_path / "managed-rollover.log"
         logger = logging.getLogger("_test_rotating_managed_rollover")
