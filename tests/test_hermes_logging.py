@@ -24,6 +24,9 @@ def _reset_logging_state():
     assertions are stable regardless of test ordering.
     """
     hermes_logging._logging_initialized = False
+    hermes_logging._configured_log_dir = None
+    hermes_logging._logging_index_written_dirs.clear()
+    hermes_logging._generated_log_instance_ids.clear()
     root = logging.getLogger()
     # Strip ALL RotatingFileHandlers — not just the ones we added — so that
     # handlers leaked from other test modules in the same xdist worker don't
@@ -44,6 +47,7 @@ def _reset_logging_state():
             root.removeHandler(h)
             h.close()
     hermes_logging._logging_initialized = False
+    hermes_logging._configured_log_dir = None
     hermes_logging.clear_session_context()
 
 
@@ -743,6 +747,144 @@ class TestAddRotatingHandler:
             if isinstance(h, RotatingFileHandler):
                 logger.removeHandler(h)
                 h.close()
+
+
+class TestPerInstanceLogging:
+    """Optional per-instance logging gives each process its own log directory."""
+
+    def test_legacy_log_dir_by_default(self, hermes_home, monkeypatch):
+        monkeypatch.delenv("HERMES_LOG_PER_INSTANCE", raising=False)
+        monkeypatch.delenv("HERMES_LOG_RUN_ID", raising=False)
+        monkeypatch.delenv("HERMES_LOG_INSTANCE_ID", raising=False)
+
+        log_dir = hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+
+        assert log_dir == hermes_home / "logs"
+        assert (log_dir / "agent.log").exists()
+
+    def test_per_instance_log_dir_from_env(self, hermes_home, monkeypatch):
+        monkeypatch.setenv("HERMES_LOG_PER_INSTANCE", "1")
+        monkeypatch.setenv("HERMES_LOG_RUN_ID", "2026-05-13")
+        monkeypatch.setenv("HERMES_LOG_INSTANCE_ID", "worker-one")
+
+        log_dir = hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+        logging.getLogger("test.per_instance").info("per instance message")
+        for h in logging.getLogger().handlers:
+            h.flush()
+
+        assert log_dir == hermes_home / "logs" / "runs" / "2026-05-13" / "worker-one"
+        assert "per instance message" in (log_dir / "agent.log").read_text()
+        assert not (hermes_home / "logs" / "agent.log").exists()
+
+    def test_per_instance_log_dir_from_config(self, hermes_home, monkeypatch):
+        import yaml
+        monkeypatch.delenv("HERMES_LOG_PER_INSTANCE", raising=False)
+        monkeypatch.setenv("HERMES_LOG_RUN_ID", "config-run")
+        monkeypatch.setenv("HERMES_LOG_INSTANCE_ID", "config-worker")
+        (hermes_home / "config.yaml").write_text(yaml.dump({"logging": {"per_instance": True}}))
+
+        log_dir = hermes_logging.setup_logging(hermes_home=hermes_home, mode="cron")
+
+        assert log_dir == hermes_home / "logs" / "runs" / "config-run" / "config-worker"
+
+    def test_per_instance_config_false_string_is_false(self, hermes_home, monkeypatch):
+        import yaml
+        monkeypatch.delenv("HERMES_LOG_PER_INSTANCE", raising=False)
+        monkeypatch.setenv("HERMES_LOG_RUN_ID", "config-run")
+        monkeypatch.setenv("HERMES_LOG_INSTANCE_ID", "config-worker")
+        (hermes_home / "config.yaml").write_text(yaml.dump({"logging": {"per_instance": "false"}}))
+
+        log_dir = hermes_logging.setup_logging(hermes_home=hermes_home, mode="cron")
+
+        assert log_dir == hermes_home / "logs"
+        assert not (hermes_home / "logs" / "runs").exists()
+
+    def test_sanitizes_run_and_instance_segments(self, hermes_home, monkeypatch):
+        monkeypatch.setenv("HERMES_LOG_PER_INSTANCE", "true")
+        monkeypatch.setenv("HERMES_LOG_RUN_ID", "../bad run")
+        monkeypatch.setenv("HERMES_LOG_INSTANCE_ID", "worker/one:two")
+
+        log_dir = hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+
+        assert log_dir == hermes_home / "logs" / "runs" / "bad-run" / "worker-one-two"
+
+    def test_index_jsonl_written_once_per_instance(self, hermes_home, monkeypatch):
+        import json
+        monkeypatch.setenv("HERMES_LOG_PER_INSTANCE", "1")
+        monkeypatch.setenv("HERMES_LOG_RUN_ID", "daily-run")
+        monkeypatch.setenv("HERMES_LOG_INSTANCE_ID", "index-worker")
+
+        log_dir = hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+
+        index_path = hermes_home / "logs" / "runs" / "daily-run" / "index.jsonl"
+        entries = [json.loads(line) for line in index_path.read_text().splitlines()]
+        assert len(entries) == 1
+        assert entries[0]["instance_id"] == "index-worker"
+        assert entries[0]["mode"] == "gateway"
+        assert entries[0]["log_dir"] == str(log_dir)
+
+    def test_second_setup_without_force_is_no_op_even_if_env_changes(self, hermes_home, monkeypatch):
+        import json
+        monkeypatch.setenv("HERMES_LOG_PER_INSTANCE", "1")
+        monkeypatch.setenv("HERMES_LOG_RUN_ID", "first-run")
+        monkeypatch.setenv("HERMES_LOG_INSTANCE_ID", "first-worker")
+
+        first = hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+        monkeypatch.setenv("HERMES_LOG_RUN_ID", "second-run")
+        monkeypatch.setenv("HERMES_LOG_INSTANCE_ID", "second-worker")
+        second = hermes_logging.setup_logging(hermes_home=hermes_home, mode="cron")
+
+        assert second == first
+        assert not (hermes_home / "logs" / "runs" / "second-run").exists()
+        entries = [json.loads(line) for line in (hermes_home / "logs" / "runs" / "first-run" / "index.jsonl").read_text().splitlines()]
+        assert len(entries) == 1
+        assert entries[0]["instance_id"] == "first-worker"
+
+    def test_generated_instance_id_is_stable_per_mode(self, hermes_home, monkeypatch):
+        import json
+        monkeypatch.setenv("HERMES_LOG_PER_INSTANCE", "1")
+        monkeypatch.setenv("HERMES_LOG_RUN_ID", "stable-run")
+        monkeypatch.delenv("HERMES_LOG_INSTANCE_ID", raising=False)
+
+        first = hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+        second = hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli", force=True)
+        gateway = hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway", force=True)
+
+        entries = [json.loads(line) for line in (hermes_home / "logs" / "runs" / "stable-run" / "index.jsonl").read_text().splitlines()]
+        assert first == second
+        assert first.name.startswith("cli-")
+        assert gateway.name.startswith("gateway-")
+        assert len(entries) == 2
+        assert {e["mode"] for e in entries} == {"cli", "gateway"}
+
+    def test_gateway_log_lives_in_instance_dir(self, hermes_home, monkeypatch):
+        monkeypatch.setenv("HERMES_LOG_PER_INSTANCE", "1")
+        monkeypatch.setenv("HERMES_LOG_RUN_ID", "gateway-run")
+        monkeypatch.setenv("HERMES_LOG_INSTANCE_ID", "gateway-worker")
+
+        log_dir = hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+        logging.getLogger("gateway.run").info("gateway per instance")
+        for h in logging.getLogger().handlers:
+            h.flush()
+
+        assert (log_dir / "gateway.log").exists()
+        assert "gateway per instance" in (log_dir / "gateway.log").read_text()
+
+    def test_index_metadata_does_not_persist_raw_argv_values(self, hermes_home, monkeypatch):
+        import json
+        monkeypatch.setenv("HERMES_LOG_PER_INSTANCE", "1")
+        monkeypatch.setenv("HERMES_LOG_RUN_ID", "argv-run")
+        monkeypatch.setenv("HERMES_LOG_INSTANCE_ID", "argv-worker")
+        monkeypatch.setattr(hermes_logging.sys, "argv", ["hermes", "chat", "-q", "OPENAI_API_KEY=sk-test-secret-value"])
+
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+
+        entry = json.loads((hermes_home / "logs" / "runs" / "argv-run" / "index.jsonl").read_text())
+        assert "argv" not in entry
+        assert entry["argv0"] == "hermes"
+        assert entry["argv_count"] == 4
+        assert "sk-test-secret-value" not in json.dumps(entry)
 
 
 class TestReadLoggingConfig:

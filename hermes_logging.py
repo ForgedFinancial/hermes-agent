@@ -23,9 +23,13 @@ Session context:
     that thread will include ``[session_id]`` for filtering/correlation.
 """
 
+import json
 import logging
 import os
+import sys
 import threading
+import uuid
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Sequence
@@ -36,6 +40,9 @@ from hermes_constants import get_config_path, get_hermes_home
 # is idempotent — calling it twice is safe but the second call is a no-op
 # unless ``force=True``.
 _logging_initialized = False
+_configured_log_dir: Optional[Path] = None
+_logging_index_written_dirs: set[Path] = set()
+_generated_log_instance_ids: dict[str, str] = {}
 
 # Thread-local storage for per-conversation session context.
 _session_context = threading.local()
@@ -149,6 +156,148 @@ COMPONENT_PREFIXES = {
 }
 
 
+
+
+# ---------------------------------------------------------------------------
+# Per-instance log directory helpers
+# ---------------------------------------------------------------------------
+
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _safe_log_segment(value: object, fallback: str, *, max_len: int = 96) -> str:
+    """Return a filesystem-safe single path segment for log run/instance IDs."""
+    raw = str(value or "").strip()
+    if not raw:
+        raw = fallback
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in raw)
+    safe = safe.strip("-_.") or fallback
+    return safe[:max_len]
+
+
+def _parse_bool_env(name: str) -> Optional[bool]:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in _TRUTHY:
+        return True
+    if normalized in _FALSY:
+        return False
+    return None
+
+
+def _read_logging_extra_config() -> dict:
+    """Best-effort read of optional logging settings from config.yaml."""
+    try:
+        import yaml
+        config_path = get_config_path()
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            log_cfg = cfg.get("logging", {})
+            if isinstance(log_cfg, dict):
+                return log_cfg
+    except Exception:
+        pass
+    return {}
+
+
+def _parse_bool_value(value: object) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in _TRUTHY:
+        return True
+    if normalized in _FALSY:
+        return False
+    return None
+
+
+def _per_instance_logging_enabled() -> bool:
+    """Whether each Hermes process should write to its own log directory."""
+    env_value = _parse_bool_env("HERMES_LOG_PER_INSTANCE")
+    if env_value is not None:
+        return env_value
+    cfg_value = _parse_bool_value(_read_logging_extra_config().get("per_instance"))
+    return bool(cfg_value)
+
+
+def _default_log_run_id() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _compute_instance_log_dir(home: Path, mode: Optional[str]) -> tuple[Path, Optional[dict]]:
+    """Return the effective log directory and optional index metadata.
+
+    Legacy behavior is preserved by default: logs go directly under
+    ``~/.hermes/logs``.  When enabled via config ``logging.per_instance`` or
+    ``HERMES_LOG_PER_INSTANCE=1``, logs go under
+    ``~/.hermes/logs/runs/<run-id>/<instance-id>`` so concurrent Hermes
+    processes never share the same rotating log file.
+    """
+    base = home / "logs"
+    if not _per_instance_logging_enabled():
+        return base, None
+
+    cfg = _read_logging_extra_config()
+    run_id = os.getenv("HERMES_LOG_RUN_ID") or cfg.get("run_id") or _default_log_run_id()
+    run_id = _safe_log_segment(run_id, _default_log_run_id())
+
+    if os.getenv("HERMES_LOG_INSTANCE_ID"):
+        instance_id = _safe_log_segment(os.getenv("HERMES_LOG_INSTANCE_ID"), "instance")
+    else:
+        prefix = _safe_log_segment(mode or "cli", "cli", max_len=24)
+        instance_key = prefix
+        if instance_key not in _generated_log_instance_ids:
+            _generated_log_instance_ids[instance_key] = _safe_log_segment(
+                f"{prefix}-{os.getpid()}-{datetime.now().strftime('%H%M%S')}-{uuid.uuid4().hex[:6]}",
+                f"{prefix}-{os.getpid()}",
+            )
+        instance_id = _generated_log_instance_ids[instance_key]
+
+    layout = str(cfg.get("instance_log_layout") or "runs").strip().lower()
+    if layout != "runs":
+        layout = "runs"
+
+    log_dir = base / layout / run_id / instance_id
+    metadata = {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "pid": os.getpid(),
+        "mode": mode or "cli",
+        "run_id": run_id,
+        "instance_id": instance_id,
+        "cwd": os.getcwd(),
+        # Do not persist raw argv: one-shot prompts, tokens, URLs, or other
+        # sensitive values can be passed on the command line.  The index is for
+        # process discovery, so argv shape is enough.
+        "argv0": Path(sys.argv[0]).name if sys.argv else "",
+        "argv_count": len(sys.argv),
+        "log_dir": str(log_dir),
+    }
+    return log_dir, metadata
+
+
+def _write_instance_index(log_dir: Path, metadata: Optional[dict]) -> None:
+    """Append one JSONL index entry for this process/log directory."""
+    if not metadata:
+        return
+    resolved = log_dir.resolve()
+    if resolved in _logging_index_written_dirs:
+        return
+    try:
+        index_path = log_dir.parent / "index.jsonl"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(index_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(metadata, sort_keys=True) + "\n")
+        _logging_index_written_dirs.add(resolved)
+    except Exception:
+        # Logging setup must never fail the agent because the index is advisory.
+        pass
+
 # ---------------------------------------------------------------------------
 # Main setup
 # ---------------------------------------------------------------------------
@@ -194,10 +343,29 @@ def setup_logging(
     Path
         The ``logs/`` directory where files are written.
     """
-    global _logging_initialized
+    global _logging_initialized, _configured_log_dir
     home = hermes_home or get_hermes_home()
-    log_dir = home / "logs"
+    if _logging_initialized and not force:
+        log_dir = _configured_log_dir or (home / "logs")
+        if mode == "gateway":
+            _cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
+            max_bytes = (max_size_mb or cfg_max_size or 5) * 1024 * 1024
+            backups = backup_count or cfg_backup or 3
+            from agent.redact import RedactingFormatter
+            _add_rotating_handler(
+                logging.getLogger(),
+                log_dir / "gateway.log",
+                level=logging.INFO,
+                max_bytes=max_bytes,
+                backup_count=backups,
+                formatter=RedactingFormatter(_LOG_FORMAT),
+                log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
+            )
+        return log_dir
+
+    log_dir, instance_metadata = _compute_instance_log_dir(home, mode)
     log_dir.mkdir(parents=True, exist_ok=True)
+    _write_instance_index(log_dir, instance_metadata)
 
     # Read config defaults (best-effort — config may not be loaded yet).
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
@@ -244,9 +412,6 @@ def setup_logging(
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
         )
 
-    if _logging_initialized and not force:
-        return log_dir
-
     # Ensure root logger level is low enough for the handlers to fire.
     if root.level == logging.NOTSET or root.level > level:
         root.setLevel(level)
@@ -256,6 +421,7 @@ def setup_logging(
         logging.getLogger(name).setLevel(logging.WARNING)
 
     _logging_initialized = True
+    _configured_log_dir = log_dir
     return log_dir
 
 
